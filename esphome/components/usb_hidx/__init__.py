@@ -31,7 +31,7 @@ KEYBOARD_SCHEMA = cv.Schema(
     {
         cv.Optional(CONF_DEVICE_ID): cv.string,
         cv.Optional(CONF_LAYOUT, default="us"): cv.one_of(
-            "us", "uk", "de", "fr", "es", lower=True
+            "us", "uk", "de", "fr", "es", "de-ch", lower=True
         ),
     }
 )
@@ -88,6 +88,8 @@ async def to_code(config):
             cg.add_define("KEYBOARD_LAYOUT_FR")
         elif layout == "es":
             cg.add_define("KEYBOARD_LAYOUT_ES")
+        elif layout == "de-ch":
+            cg.add_define("KEYBOARD_LAYOUT_DE_CH")
     if CONF_MOUSE in config:
         cg.add_define("USB_HIDX_ENABLE_MOUSE")
     if CONF_GAMEPAD in config:
