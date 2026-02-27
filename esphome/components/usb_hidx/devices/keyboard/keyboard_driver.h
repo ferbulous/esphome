@@ -70,6 +70,8 @@ class KeyboardDriver : public HIDDeviceDriver {
     bool shift = (data[0] & 0x22) != 0;
     bool win_key = (data[0] & 0x08) != 0;   // Left GUI/Windows key
     bool ctrl_key = (data[0] & 0x01) != 0;  // Left Ctrl key
+    bool alt_key = (data[0] & 0x04) != 0;
+    bool alt_gr = (data[0] & 0x40) != 0;
 
     for (int i = 2; i < 8; i++) {
       if (data[i] != 0) {
@@ -130,26 +132,23 @@ class KeyboardDriver : public HIDDeviceDriver {
             ESP_LOGI("KeyboardDriver", "Scroll Lock: %s", scroll_lock_state_ ? "ON" : "OFF");
             update_keyboard_leds(device);
           } else {
-            // Convert to ASCII and build string
-            char ascii = hid_to_ascii(data[i], shift);
-            if (ascii != 0) {
-              if (ascii == '\b') {
+            const char* text = hid_to_ascii(data[i], shift, alt_gr);
+            ESP_LOGI("Fredo", "%s", text);
+            if (text[0] != '\0') {
+              if (strcmp(text, "\b") == 0) { // Backspace
                 if (!keyboard_buffer_.empty()) {
                   keyboard_buffer_.pop_back();
                 }
-              } else if (ascii == '\n') {
-                ESP_LOGI("KeyboardDriver", "Enter pressed, clearing buffer");
+              } else if (strcmp(text, "\n") == 0 || strcmp(text, "\r") == 0) {
+                if (!keyboard_buffer_.empty() && parent_->get_keyboard_sensor()) {
+                  parent_->get_keyboard_sensor()->publish_state(keyboard_buffer_);
+                  ESP_LOGI("KeyboardDriver", "Full scan sent: %s", keyboard_buffer_.c_str());
+                }
                 keyboard_buffer_.clear();
               } else {
-                keyboard_buffer_ += ascii;
+                // 5. Anhängen: Das funktioniert bei std::string += const char* weiterhin super.
+                keyboard_buffer_ += text;
               }
-              if (parent_->get_keyboard_sensor()) {
-                parent_->get_keyboard_sensor()->publish_state(keyboard_buffer_);
-              }
-            } else {
-              // Non-ASCII key, publish key name
-              const char *key_name = hid_keycode_to_name(data[i]);
-              ESP_LOGI("KeyboardDriver", "Key: %s (0x%02X)", key_name, data[i]);
             }
           }
         }
@@ -167,144 +166,184 @@ class KeyboardDriver : public HIDDeviceDriver {
   bool caps_lock_state_{false};
   bool num_lock_state_{false};
   bool scroll_lock_state_{false};
+  bool dead_key_dieresis_{false};
 
-  char hid_to_ascii(uint8_t keycode, bool shift) {
+  const char* hid_to_ascii(uint8_t keycode, bool shift, bool alt_gr) {
+    if (keycode == 0) return "";
+    bool use_dead_key = dead_key_dieresis_;
+    dead_key_dieresis_ = false;
+    //ESP_LOGD("HID_DEBUG", "Key: 0x%02X | Shift: %d | AltGr: %d | dead_key: %d", keycode, shift, alt_gr, use_dead_key);
+    // 1. Buchstaben a-z / A-Z
     if (keycode >= 0x04 && keycode <= 0x1D) {
+      #if defined(KEYBOARD_LAYOUT_DE_CH)
+        // Tausche Y (0x1C) und Z (0x1D) für QWERTZ
+        if (keycode == 0x1C) keycode = 0x1D;      // Falls Taste Y gedrückt -> behandle als Z
+        else if (keycode == 0x1D) keycode = 0x1C; // Falls Taste Z gedrückt -> behandle als Y
+      #endif
       char c = 'a' + (keycode - 0x04);
       bool make_uppercase = shift ^ caps_lock_state_;
-      return make_uppercase ? (c - 32) : c;
-    } else if (keycode >= 0x1E && keycode <= 0x27) {
-      const char numbers[] = "1234567890";
-#if defined(KEYBOARD_LAYOUT_UK)
-      const char shifted[] = "!\"£$%^&*()";
-#elif defined(KEYBOARD_LAYOUT_DE)
-      const char shifted[] = "!\"§$%&/()=";
-#elif defined(KEYBOARD_LAYOUT_FR)
-      const char shifted[] = "&é\"'(-è_çà";
-#elif defined(KEYBOARD_LAYOUT_ES)
-      const char shifted[] = "!\"·$%&/()=";
-#else  // US layout
-      const char shifted[] = "!@#$%^&*()";
-#endif
-      return shift ? shifted[keycode - 0x1E] : numbers[keycode - 0x1E];
+      static char s_res[5]; // Statischer Puffer für berechnete Zeichen
+      memset(s_res, 0, sizeof(s_res));
+      #if defined(KEYBOARD_LAYOUT_DE_CH)
+        if (keycode == 0x08 && alt_gr) {
+          return "€";
+        }
+
+        if (keycode == 0x08 && alt_gr) return "€";
+        if (use_dead_key) {
+            if (c == 'u') return make_uppercase ? "Ü" : "ü";
+            if (c == 'o') return make_uppercase ? "Ö" : "ö";
+            if (c == 'a') return make_uppercase ? "Ä" : "ä";
+            if (c == 'e') return make_uppercase ? "Ë" : "ë";
+            if (c == 'i') return make_uppercase ? "Ï" : "ï";
+
+            // Fallback: Trema UTF-8 manuell in Puffer schreiben
+            s_res[0] = (char)0xC2; s_res[1] = (char)0xA8; 
+            s_res[2] = (char)(make_uppercase ? (c - 32) : c);
+            return s_res;
+        }
+      #endif
+      s_res[0] = (char)(make_uppercase ? (c - 32) : c);
+      return s_res;
     }
+    
+    // 2. Zahlenreihe
+    else if (keycode >= 0x1E && keycode <= 0x27) {
+      const char* num_map[] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"};
+  #if defined(KEYBOARD_LAYOUT_UK)
+      const char* shifted[] = {"!", "\"", "£", "$", "%", "^", "&", "*", "(", ")"};
+      const char* altered[] = {"", "", "", "", "", "", "", "", "", ""};
+  #elif defined(KEYBOARD_LAYOUT_DE)
+      const char* shifted[] = {"!", "\"", "§", "$", "%", "&", "/", "(", ")", "="};
+      const char* altered[] = {"", "", "", "", "", "", "", "", "", ""};
+  #elif defined(KEYBOARD_LAYOUT_FR)
+      const char* shifted[] = {"&", "é", "\"", "'", "(", "-", "è", "_", "ç", "à"};
+      const char* altered[] = {"", "", "", "", "", "", "", "", "", ""};
+  #elif defined(KEYBOARD_LAYOUT_ES)
+      const char* shifted[] = {"!", "\"", "·", "$", "%", "&", "/", "(", ")", "="};
+      const char* altered[] = {"", "", "", "", "", "", "", "", "", ""};
+  #elif defined(KEYBOARD_LAYOUT_DE_CH)
+      const char* shifted[] = {"+", "\"", "*", "ç", "%", "&", "/", "(", ")", "="};
+      const char* altered[] = {"¦", "@", "#", "°", "§", "¬", "|", "¢", "", ""};
+  #else  // US layout
+      const char* shifted[] = {"+", "\"", "#", "$", "%", "^", "&", "*", "(", ")"};
+      const char* altered[] = {"", "", "", "", "", "", "", "", "", ""};
+  #endif
+      if (shift) return shifted[keycode - 0x1E];
+      if (alt_gr) return altered[keycode - 0x1E];
+      //ESP_LOGD("HID_DEBUG", "Zahl: 0x%02X | Shift: %d | AltGr: %d | dead_key: %d", keycode, shift, alt_gr, use_dead_key);
+      return num_map[keycode - 0x1E];
+    }
+
+    // 3. Sonderzeichen und Steuerzeichen
     switch (keycode) {
-      case 0x2C:
-        return ' ';
-      case 0x28:
-        return '\n';
-      case 0x2A:
-        return '\b';
-#if defined(KEYBOARD_LAYOUT_UK)
-      case 0x2D:
-        return shift ? '_' : '-';
-      case 0x2E:
-        return shift ? '+' : '=';
-      case 0x2F:
-        return shift ? '{' : '[';
-      case 0x30:
-        return shift ? '}' : ']';
-      case 0x31:
-        return shift ? '~' : '#';
-      case 0x33:
-        return shift ? ':' : ';';
-      case 0x34:
-        return shift ? '@' : '\'';
-      case 0x35:
-        return shift ? '¬' : '`';
-      case 0x36:
-        return shift ? '<' : ',';
-      case 0x37:
-        return shift ? '>' : '.';
-      case 0x38:
-        return shift ? '?' : '/';
-      case 0x64:
-        return shift ? '|' : '\\';
-#elif defined(KEYBOARD_LAYOUT_DE)
-      case 0x2D:
-        return shift ? '?' : 'ß';
-      case 0x2E:
-        return shift ? '`' : '´';
-      case 0x2F:
-        return shift ? '?' : 'ü';
-      case 0x30:
-        return shift ? '*' : '+';
-      case 0x31:
-        return shift ? '\'' : '#';
-      case 0x33:
-        return shift ? ';' : 'ö';
-      case 0x34:
-        return shift ? ':' : 'ä';
-      case 0x35:
-        return shift ? '°' : '^';
-      case 0x36:
-        return shift ? ';' : ',';
-      case 0x37:
-        return shift ? ':' : '.';
-      case 0x38:
-        return shift ? '_' : '-';
-      case 0x64:
-        return shift ? '>' : '<';
-#else  // US, FR, ES layouts (similar to US)
-      case 0x2D:
-        return shift ? '_' : '-';
-      case 0x2E:
-        return shift ? '+' : '=';
-      case 0x2F:
-        return shift ? '{' : '[';
-      case 0x30:
-        return shift ? '}' : ']';
-      case 0x31:
-        return shift ? '|' : '\\';
-      case 0x33:
-        return shift ? ':' : ';';
-      case 0x34:
-        return shift ? '"' : '\'';
-      case 0x35:
-        return shift ? '~' : '`';
-      case 0x36:
-        return shift ? '<' : ',';
-      case 0x37:
-        return shift ? '>' : '.';
-      case 0x38:
-        return shift ? '?' : '/';
-#endif
-      case 0x2B:
-        return '\t';
-      case 0x59:
-        return num_lock_state_ ? '1' : 0;
-      case 0x5A:
-        return num_lock_state_ ? '2' : 0;
-      case 0x5B:
-        return num_lock_state_ ? '3' : 0;
-      case 0x5C:
-        return num_lock_state_ ? '4' : 0;
-      case 0x5D:
-        return num_lock_state_ ? '5' : 0;
-      case 0x5E:
-        return num_lock_state_ ? '6' : 0;
-      case 0x5F:
-        return num_lock_state_ ? '7' : 0;
-      case 0x60:
-        return num_lock_state_ ? '8' : 0;
-      case 0x61:
-        return num_lock_state_ ? '9' : 0;
-      case 0x62:
-        return num_lock_state_ ? '0' : 0;
-      case 0x63:
-        return num_lock_state_ ? '.' : 0;
-      case 0x54:
-        return '/';
-      case 0x55:
-        return '*';
-      case 0x56:
-        return '-';
-      case 0x57:
-        return '+';
-      case 0x58:
-        return '\n';
-      default:
-        return 0;
+      case 0x2C: return " ";
+      case 0x28: return "\n";
+      case 0x2A: return "\b";
+      case 0x2B: return "\t";
+
+  #if defined(KEYBOARD_LAYOUT_UK)
+      case 0x2D: return shift ? "_" : "-";
+      case 0x2E: return shift ? "+" : "=";
+      case 0x2F: return shift ? "{" : "[";
+      case 0x30: return shift ? "}" : "]";
+      case 0x31: return shift ? "~" : "#";
+      case 0x33: return shift ? ":" : ";";
+      case 0x34: return shift ? "@" : "'";
+      case 0x35: return shift ? "¬" : "`";
+      case 0x36: return shift ? "<" : ",";
+      case 0x37: return shift ? ">" : ".";
+      case 0x38: return shift ? "?" : "/";
+      case 0x64: return shift ? "|" : "\\";
+  #elif defined(KEYBOARD_LAYOUT_DE)
+      case 0x2D: return shift ? "?" : "ß";
+      case 0x2E: return shift ? "`" : "´";
+      case 0x2F: return shift ? "Ü" : "ü";
+      case 0x30: return shift ? "*" : "+";
+      case 0x31: return shift ? "'" : "#";
+      case 0x33: return shift ? "Ö" : "ö";
+      case 0x34: return shift ? "Ä" : "ä";
+      case 0x35: return shift ? "°" : "^";
+      case 0x36: return shift ? ";" : ",";
+      case 0x37: return shift ? ":" : ".";
+      case 0x38: return shift ? "_" : "-";
+      case 0x64: return shift ? ">" : "<";
+  #elif defined(KEYBOARD_LAYOUT_DE_CH)
+      case 0x2D: return shift ? "?" : (alt_gr ? "~" : "'");
+      case 0x2E: return shift ? "`" : (alt_gr ? "´" : "^");
+      case 0x2F: 
+          if (shift && caps_lock_state_) return "È";
+          if (shift) return "è";
+          if (caps_lock_state_) return "Ü";
+          return "ü";
+
+      case 0x30: // Die Taste ¨ / ! / ]
+          if (shift) return "!";
+          if (alt_gr) return "]";
+          dead_key_dieresis_ = true; // Merker setzen
+          return ""; 
+
+      case 0x31: 
+          if (alt_gr) return "}";
+          if (shift) return "£";
+          return "$";
+
+      case 0x32: 
+          if (shift) return "!"; 
+          if (alt_gr) return "]";
+          dead_key_dieresis_ = true;
+          return "";
+
+      case 0x33: 
+          if (shift && caps_lock_state_) return "É";
+          if (shift) return "é";
+          if (caps_lock_state_) return "Ö";
+          return "ö";
+
+      case 0x34: 
+          if (shift && caps_lock_state_) return "À";
+          if (shift) return "à";
+          if (caps_lock_state_) return "Ä";
+          return "ä";
+
+      case 0x35: return shift ? "°" : "§";
+      case 0x36: return shift ? ";" : ",";
+      case 0x37: return shift ? ":" : ".";
+      case 0x38: return shift ? "_" : "-";
+      case 0x64: return shift ? ">" : (alt_gr ? "\\" : "<");
+  #else  // US Layout
+      case 0x2D: return shift ? "_" : "-";
+      case 0x2E: return shift ? "+" : "=";
+      case 0x2F: return shift ? "{" : "[";
+      case 0x30: return shift ? "}" : "]";
+      case 0x31: return shift ? "|" : "\\";
+      case 0x33: return shift ? ":" : ";";
+      case 0x34: return shift ? "\"" : "'";
+      case 0x35: return shift ? "~" : "`";
+      case 0x36: return shift ? "<" : ",";
+      case 0x37: return shift ? ">" : ".";
+      case 0x38: return shift ? "?" : "/";
+  #endif
+
+      // Nummernblock
+      case 0x59: return num_lock_state_ ? "1" : "";
+      case 0x5A: return num_lock_state_ ? "2" : "";
+      case 0x5B: return num_lock_state_ ? "3" : "";
+      case 0x5C: return num_lock_state_ ? "4" : "";
+      case 0x5D: return num_lock_state_ ? "5" : "";
+      case 0x5E: return num_lock_state_ ? "6" : "";
+      case 0x5F: return num_lock_state_ ? "7" : "";
+      case 0x60: return num_lock_state_ ? "8" : "";
+      case 0x61: return num_lock_state_ ? "9" : "";
+      case 0x62: return num_lock_state_ ? "0" : "";
+      case 0x63: return num_lock_state_ ? "." : "";
+      case 0x54: return "/";
+      case 0x55: return "*";
+      case 0x56: return "-";
+      case 0x57: return "+";
+      case 0x58: return "\n";
+
+      default: return "";
     }
   }
 
